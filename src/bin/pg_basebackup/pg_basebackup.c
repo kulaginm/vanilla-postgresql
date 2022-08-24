@@ -156,6 +156,7 @@ static bool success = false;
 static bool made_new_pgdata = false;
 static bool found_existing_pgdata = false;
 static bool made_new_xlogdir = false;
+static bool made_tmp_xlogdir = false;
 static bool found_existing_xlogdir = false;
 static bool made_tablespace_dirs = false;
 static bool found_tablespace_dirs = false;
@@ -216,6 +217,13 @@ static void tablespace_list_append(const char *arg);
 static void
 cleanup_directories_atexit(void)
 {
+	if (!in_log_streamer && made_tmp_xlogdir)
+	{
+		pg_log_info("removing temporary WAL directory \"%s\"", xlog_dir);
+		if (!rmtree(xlog_dir, true))
+			pg_log_error("failed to remove temp WAL directory");
+	}
+
 	if (success || in_log_streamer)
 		return;
 
@@ -554,7 +562,7 @@ LogStreamerMain(logstreamer_param *param)
 	stream.partial_suffix = NULL;
 	stream.replication_slot = replication_slot;
 
-	if (format == 'p')
+	if (format == 'p' || (format == 't' && strcmp(basedir, "-") == 0))
 		stream.walmethod = CreateWalDirectoryMethod(param->xlog, 0,
 													stream.do_sync);
 	else
@@ -578,7 +586,7 @@ LogStreamerMain(logstreamer_param *param)
 
 	PQfinish(param->bgconn);
 
-	if (format == 'p')
+	if (format == 'p' || (format == 't' && strcmp(basedir, "-") == 0))
 		FreeWalDirectoryMethod();
 	else
 		FreeWalTarMethod();
@@ -630,11 +638,31 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier)
 		/* Error message already written in GetConnection() */
 		exit(1);
 
-	/* In post-10 cluster, pg_xlog has been renamed to pg_wal */
-	snprintf(param->xlog, sizeof(param->xlog), "%s/%s",
-			 basedir,
-			 PQserverVersion(conn) < MINIMUM_VERSION_FOR_PG_WAL ?
-			 "pg_xlog" : "pg_wal");
+	if (format == 'p' || strcmp(basedir, "-") != 0)
+	{
+		/* In post-10 cluster, pg_xlog has been renamed to pg_wal */
+		snprintf(param->xlog, sizeof(param->xlog), "%s/%s",
+				 basedir,
+				 PQserverVersion(conn) < MINIMUM_VERSION_FOR_PG_WAL ?
+				 "pg_xlog" : "pg_wal");
+	}
+	else
+	{
+		snprintf(param->xlog, sizeof(param->xlog),
+				"%s/pg_basebackup-wals-XXXXXX",
+				getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+
+		if (mkdtemp(param->xlog) == NULL)
+		{
+			pg_log_error("could not create directory \"%s\": %m",
+						param->xlog);
+			exit(1);
+		}
+		xlog_dir = param->xlog;
+		made_tmp_xlogdir = true;
+		pg_log_info("created temporary WAL directory \"%s\"",
+					param->xlog);
+	}
 
 	/* Temporary replication slots are only supported in 10 and newer */
 	if (PQserverVersion(conn) < MINIMUM_VERSION_FOR_TEMP_SLOTS)
@@ -1102,7 +1130,7 @@ ReceiveTarFilesAndRepack(PGconn *conn, PGresult *res)
 	}
 
 	/* 2 * TAR_BLOCK_SIZE bytes empty data at end of file */
-	writeTarData(&state, zerobuf, sizeof(zerobuf));
+	//writeTarData(&state, zerobuf, sizeof(zerobuf));
 }
 
 /*
@@ -2353,6 +2381,90 @@ BaseBackup(void)
 	PQfinish(conn);
 	conn = NULL;
 
+	if (writing_to_stdout)
+	{
+		char			zerobuf[TAR_BLOCK_SIZE * 2];
+		WriteTarState	state;
+
+		memset(&state, 0, sizeof(state));
+		state.tarfile = stdout;
+		strcpy(state.filename, "-");
+
+		if (includewal == STREAM_WAL)
+		{
+			DIR			  *dir;
+			struct dirent *dirent;
+			void   *buf;
+
+			pg_log_info("appending streamed WALs to tar");
+
+			dir = opendir(xlog_dir);
+			if (dir == NULL)
+			{
+				pg_log_error("could not open directory \"%s\": %m",
+							xlog_dir);
+				exit(1);
+			}
+
+			buf = pg_malloc0(16* 1024* 1024);
+
+			while (errno = 0, (dirent = readdir(dir)) != NULL)
+			{
+				char   *filename = dirent->d_name;
+				char	fullfilename[MAXPGPATH];
+				int		padding;
+
+				/* Skip "." and ".." */
+				if (filename[0] == '.' && (filename[1] == '\0' || strcmp(filename, "..") == 0))
+					continue;
+
+				snprintf(fullfilename, sizeof(fullfilename), "%s/%s", xlog_dir, filename);
+				{
+					char		header[TAR_BLOCK_SIZE];
+					struct stat statbuf;
+					char		filename_for_tar[MAXPGPATH];
+
+					snprintf(filename_for_tar, sizeof(filename_for_tar), "%s/%s", "pg_wal", filename);
+					stat(fullfilename, &statbuf); /* TODO check error */
+					tarCreateHeader(header, filename_for_tar, NULL, statbuf.st_size,
+									statbuf.st_mode, statbuf.st_uid, statbuf.st_uid,
+									statbuf.st_mtime);
+					writeTarData(&state, header, sizeof(header));
+					padding = tarPaddingBytesRequired(statbuf.st_size);
+				}
+				{
+					FILE   *f;
+					size_t	r;
+
+					f = fopen(fullfilename, "rb");
+					if (f == NULL)
+					{
+							pg_log_error("could not open file \"%s\": %m",
+										fullfilename);
+							exit(1);
+					}
+					r = fread(buf, 1, 16 * 1024 * 1024, f);
+					writeTarData(&state, buf, r);
+					fclose(f);
+
+					if (padding)
+						writeTarData(&state, zerobuf, padding);
+				}
+			}
+
+			if (closedir(dir))
+			{
+				pg_log_error("could not close directory \"%s\": %m",
+							xlog_dir);
+				exit(1);
+			}
+		}
+
+		/* 2 * TAR_BLOCK_SIZE bytes empty data at end of file */
+		MemSet(zerobuf, 0, sizeof(zerobuf));
+		writeTarData(&state, zerobuf, sizeof(zerobuf));
+	}
+
 	/*
 	 * Make data persistent on disk once backup is completed. For tar format
 	 * sync the parent directory and all its contents as each tar file was not
@@ -2659,14 +2771,6 @@ main(int argc, char **argv)
 	if (format == 'p' && compresslevel != 0)
 	{
 		pg_log_error("only tar mode backups can be compressed");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
-		exit(1);
-	}
-
-	if (format == 't' && includewal == STREAM_WAL && strcmp(basedir, "-") == 0)
-	{
-		pg_log_error("cannot stream write-ahead logs in tar mode to stdout");
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 				progname);
 		exit(1);
