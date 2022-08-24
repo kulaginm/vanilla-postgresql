@@ -64,6 +64,7 @@ typedef struct WriteTarState
 	FILE	   *tarfile;
 	char		tarhdr[TAR_BLOCK_SIZE];
 	bool		basetablespace;
+	char		tablespace_path[MAXPGPATH];
 	bool		in_tarhdr;
 	bool		skip_file;
 	bool		is_recovery_guc_supported;
@@ -193,6 +194,7 @@ static void progress_report(int tablespacenum, const char *filename, bool force,
 
 static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum);
 static void ReceiveTarCopyChunk(size_t r, char *copybuf, void *callback_data);
+static void ReceiveTarCopyChunkAndInjectPath(size_t r, char *copybuf, void *callback_data);
 static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum);
 static void ReceiveTarAndUnpackCopyChunk(size_t r, char *copybuf,
 										 void *callback_data);
@@ -1026,6 +1028,84 @@ writeTarData(WriteTarState *state, char *buf, int r)
 }
 
 /*
+ * always stdout
+ */
+static void
+ReceiveTarFilesAndRepack(PGconn *conn, PGresult *res)
+{
+	int 		rownum;
+	char		zerobuf[TAR_BLOCK_SIZE * 2];
+	WriteTarState state;
+
+	memset(&state, 0, sizeof(state));
+	state.tarfile = stdout;
+	strcpy(state.filename, "-");
+
+	/* recovery.conf is integrated into postgresql.conf in 12 and newer */
+	if (PQserverVersion(conn) >= MINIMUM_VERSION_FOR_RECOVERY_GUC)
+		state.is_recovery_guc_supported = true;
+
+#ifdef WIN32
+	_setmode(fileno(stdout), _O_BINARY);
+#endif
+
+	for (rownum = 0; rownum < PQntuples(res); rownum++)
+	{
+		state.tablespacenum = rownum;
+		state.basetablespace = PQgetisnull(res, rownum, 0);
+		if (state.basetablespace)
+			state.tablespace_path[0] = '\0';
+		else
+			strlcpy(state.tablespace_path,
+				get_tablespace_mapping(PQgetvalue(res, rownum, 1)),
+				sizeof(state.tablespace_path));
+		state.in_tarhdr = true;
+
+#ifdef HAVE_LIBZ
+/* not implemented yet */
+#endif
+
+		/* TODO rewrite tablespace_map file */
+		ReceiveCopyData(conn, state.basetablespace ? ReceiveTarCopyChunk : ReceiveTarCopyChunkAndInjectPath, &state);
+
+		//progress_report(rownum, state.filename, true, false);
+	}
+
+	/* TODO Write recovery.conf */
+
+	MemSet(zerobuf, 0, sizeof(zerobuf));
+
+	/* Write backup manifest */
+	if (manifest)
+	{
+		char		header[TAR_BLOCK_SIZE];
+		PQExpBufferData buf;
+		int			padding;
+
+		initPQExpBuffer(&buf);
+		ReceiveBackupManifestInMemory(conn, &buf);
+		if (PQExpBufferDataBroken(buf))
+		{
+			pg_log_error("out of memory");
+			exit(1);
+		}
+		tarCreateHeader(header, "backup_manifest", NULL, buf.len,
+						pg_file_create_mode, 04000, 02000,
+						time(NULL));
+		writeTarData(&state, header, sizeof(header));
+		writeTarData(&state, buf.data, buf.len);
+		padding = tarPaddingBytesRequired(buf.len);
+		termPQExpBuffer(&buf);
+
+		if (padding)
+			writeTarData(&state, zerobuf, padding);
+	}
+
+	/* 2 * TAR_BLOCK_SIZE bytes empty data at end of file */
+	writeTarData(&state, zerobuf, sizeof(zerobuf));
+}
+
+/*
  * Receive a tar format file from the connection to the server, and write
  * the data from this file directly into a tar file. If compression is
  * enabled, the data will be compressed while written to the file.
@@ -1480,6 +1560,114 @@ ReceiveTarCopyChunk(size_t r, char *copybuf, void *callback_data)
 	progress_report(state->tablespacenum, state->filename, false, false);
 }
 
+/*
+ *
+ */
+static void
+ReceiveTarCopyChunkAndInjectPath(size_t r, char *copybuf, void *callback_data)
+{
+	WriteTarState *state = callback_data;
+
+	/*
+	 *
+	 */
+	int			rr = r;
+	int			pos = 0;
+
+	while (rr > 0)
+	{
+		if (state->in_tarhdr)
+		{
+			/*
+			 * We're currently reading a header structure inside the TAR
+			 * stream, i.e. the file metadata.
+			 */
+			if (state->tarhdrsz < TAR_BLOCK_SIZE)
+			{
+				/*
+				 * Copy the header structure into tarhdr in case the
+				 * header is not aligned properly or it's not returned in
+				 * whole by the last PQgetCopyData call.
+				 */
+				int			hdrleft;
+				int			bytes2copy;
+
+				hdrleft = TAR_BLOCK_SIZE - state->tarhdrsz;
+				bytes2copy = (rr > hdrleft ? hdrleft : rr);
+
+				memcpy(&state->tarhdr[state->tarhdrsz], copybuf + pos,
+					   bytes2copy);
+
+				rr -= bytes2copy;
+				pos += bytes2copy;
+				state->tarhdrsz += bytes2copy;
+			}
+			if (state->tarhdrsz == TAR_BLOCK_SIZE)
+			{
+				/*
+				 * We have the complete header structure in tarhdr, look
+				 * at the file metadata
+				 */
+				char		new_filename[MAXPGPATH]; // tar only allow 100+155 filenames TODO check
+
+				state->filesz = read_tar_number(&state->tarhdr[124], 12);
+				state->file_padding_len =
+					tarPaddingBytesRequired(state->filesz);
+				state->filesz += state->file_padding_len;
+
+				/* replace tar header */
+				snprintf(new_filename, sizeof(new_filename), "%s/%s", state->tablespace_path, &state->tarhdr[0]);
+				if (strlen(new_filename) > 99)
+				{
+						pg_log_error("file name too long for tar format: \"%s\"", new_filename);
+						exit(1);
+				}
+
+				strlcpy(&state->tarhdr[0], new_filename, 100);
+				print_tar_number(&state->tarhdr[148], 8, tarChecksum(state->tarhdr));
+				writeTarData(state, state->tarhdr, sizeof(state->tarhdr));
+
+				/* Next part is the file, not the header */
+				state->in_tarhdr = false;
+			}
+		}
+		else
+		{
+			/*
+			 * We're processing a file's contents.
+			 */
+			if (state->filesz > 0)
+			{
+				/*
+				 * We still have data to read (and possibly write).
+				 */
+				int			bytes2write;
+
+				bytes2write = (state->filesz > rr ? rr : state->filesz);
+
+				writeTarData(state, copybuf + pos, bytes2write);
+
+				rr -= bytes2write;
+				pos += bytes2write;
+				state->filesz -= bytes2write;
+			}
+			else
+			{
+				/*
+				 * No more data in the current file, the next piece of
+				 * data (if any) will be a new file header structure.
+				 */
+				state->in_tarhdr = true;
+				state->skip_file = false;
+				state->is_postgresql_auto_conf = false;
+				state->tarhdrsz = 0;
+				state->filesz = 0;
+			}
+		}
+	}
+	totaldone += r;
+	//progress_report(state->tablespacenum, state->filename, false, false);
+}
 
 /*
  * Retrieve tablespace path, either relocated or original depending on whether
@@ -1988,17 +2176,6 @@ BaseBackup(void)
 	}
 
 	/*
-	 * When writing to stdout, require a single tablespace
-	 */
-	writing_to_stdout = format == 't' && strcmp(basedir, "-") == 0;
-	if (writing_to_stdout && PQntuples(res) > 1)
-	{
-		pg_log_error("can only write single tablespace to stdout, database has %d",
-					 PQntuples(res));
-		exit(1);
-	}
-
-	/*
 	 * If we're streaming WAL, start the streaming session before we start
 	 * receiving the actual data chunks.
 	 */
@@ -2012,13 +2189,17 @@ BaseBackup(void)
 	/*
 	 * Start receiving chunks
 	 */
-	for (i = 0; i < PQntuples(res); i++)
-	{
-		if (format == 't')
-			ReceiveTarFile(conn, res, i);
-		else
-			ReceiveAndUnpackTarFile(conn, res, i);
-	}							/* Loop over all tablespaces */
+	writing_to_stdout = format == 't' && strcmp(basedir, "-") == 0;
+	if (writing_to_stdout)
+		ReceiveTarFilesAndRepack(conn, res);
+	else
+		for (i = 0; i < PQntuples(res); i++)
+		{
+			if (format == 't')
+				ReceiveTarFile(conn, res, i);
+			else
+				ReceiveAndUnpackTarFile(conn, res, i);
+		}							/* Loop over all tablespaces */
 
 	/*
 	 * Now receive backup manifest, if appropriate.
